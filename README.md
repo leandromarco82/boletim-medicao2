@@ -1,12 +1,11 @@
 # Boletim de Medição – Glosas (Streamlit) · versão 2
 
-Fluxo: **Unidade → Sistema → Contrato → NF → Ocorrências → Glosa e e-mail → Resumo**.
+Fluxo: **Unidade → Sistema → Contrato → Ocorrências → Glosa e e-mail → Resumo**.
 Os contratos vêm da planilha `contratos.xlsx` (colunas: Unidade, Sistema, Fornecedor, Contrato, Valor anual).
 
-## O que mudou na v2
+## O que mudou na v2 (atualização sem NF)
 - Cada unidade escolhe seu sistema; fornecedor, contrato e valor anual vêm da planilha.
-- Conferência da NF: o app compara o valor da NF com o valor mensal do contrato (anual ÷ 12) e avisa se houver diferença.
-- Número da NF registrado e incluído no parecer.
+- Sem campo de NF: o boletim é feito antes da emissão. O app calcula as glosas sobre o valor mensal do contrato (anual ÷ 12) e informa o valor a faturar.
 - Glosas, SLA e e-mail são guardados por unidade + contrato (o mesmo código de contrato pode existir em unidades diferentes).
 - Resumo por unidade, com status Lançado/Pendente, e resumo de todas as unidades (CSV).
 - Planilha atualizável pelo menu lateral (Cadastro de contratos), sem mexer no código.

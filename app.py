@@ -151,11 +151,12 @@ def get_boletim(unidade, contrato, mes):
     return dict(r) if r else None
 
 
-def save_boletim(unidade, contrato, mes, nf_num, nf):
+def save_boletim(unidade, contrato, mes, valor_base):
+    """Marca o boletim do mês como lançado (a NF ainda não existe nesta etapa)."""
     with db() as con:
         con.execute(
             "INSERT OR REPLACE INTO b_boletins(unidade, contrato, mes, nf_num, nf) VALUES (?,?,?,?,?)",
-            (unidade, contrato, mes, nf_num, nf),
+            (unidade, contrato, mes, "", valor_base),
         )
 
 
@@ -243,32 +244,25 @@ def calcular(termos, nf, dfs):
     return {"partes": partes, "total": total, "pagar": nf - total, "nf": nf}
 
 
-def parecer(c, mes, nf_num, mensal, res):
+def parecer(c, mes, mensal, res):
     linhas = [
         f"• {p['nome']}: {p['viol']} de {p['n']} ocorrência(s) com descumprimento → "
         + (f"glosa de {pct(p['pct'])} ({brl(p['valor'])})" if p["valor"] else "sem glosa")
         for p in res["partes"]
     ]
-    dif = res["nf"] - mensal
-    conf = (
-        "NF compatível com o valor mensal do contrato."
-        if abs(dif) < 0.005
-        else f"ATENÇÃO: NF diverge do valor mensal do contrato ({brl(mensal)}) em {brl(dif)}."
-    )
     fecho = (
-        "Solicitamos a emissão de NF/ajuste considerando as glosas acima. "
+        "Solicitamos a emissão da NF no valor a faturar acima, já considerando as glosas. "
         "Em caso de contestação, favor encaminhar as evidências."
         if res["total"]
-        else "Não há glosas neste período."
+        else "Não há glosas neste período. A NF pode ser emitida pelo valor mensal do contrato."
     )
     return (
         f"Prezados ({c['fornecedor']}),\n\n"
         f"Segue o resultado da medição referente a {mes}.\n"
-        f"Unidade: {c['unidade']}\nSistema: {c['sistema']}\nContrato: {c['contrato']}\n"
-        f"NF nº: {nf_num or 'não informada'}\n\n"
-        f"Valor da NF: {brl(res['nf'])}\n{conf}\n\n"
+        f"Unidade: {c['unidade']}\nSistema: {c['sistema']}\nContrato: {c['contrato']}\n\n"
+        f"Valor mensal do contrato: {brl(mensal)}\n\n"
         + "\n".join(linhas)
-        + f"\n\nTotal de glosas: {brl(res['total'])}\nValor a pagar: {brl(res['pagar'])}\n\n{fecho}\n\n"
+        + f"\n\nTotal de glosas: {brl(res['total'])}\nValor a faturar (NF): {brl(res['pagar'])}\n\n{fecho}\n\n"
         "Atenciosamente,\nGestão de Manutenção"
     )
 
@@ -312,22 +306,23 @@ def resumo_unidade(cad_u, mes):
         t = get_termos(c["unidade"], c["contrato"], c["fornecedor"])
         b = get_boletim(c["unidade"], c["contrato"], mes)
         d = {tp: load_occ(c["unidade"], c["contrato"], mes, tp) for tp in TIPOS}
-        nf = b["nf"] if b else 0.0
-        r = calcular(t, nf, d)
+        mensal = round(float(c["valor_anual"]) / 12, 2)
+        r = calcular(t, mensal, d)
         linhas.append(
             {
                 "Unidade": c["unidade"], "Sistema": c["sistema"], "Contrato": c["contrato"],
                 "Fornecedor": c["fornecedor"], "Status": "Lançado" if b else "Pendente",
-                "NF nº": b["nf_num"] if b else "", "NF": nf,
+                "Valor mensal": mensal,
                 "Corretivas": r["partes"][0]["valor"], "Preventivas": r["partes"][1]["valor"],
-                "Relatórios": r["partes"][2]["valor"], "Glosa total": r["total"], "A pagar": r["pagar"],
+                "Relatórios": r["partes"][2]["valor"], "Glosa total": r["total"], "A faturar": r["pagar"],
             }
         )
     return pd.DataFrame(linhas)
 
 
 def tabela_resumo(df):
-    cfg = {c: st.column_config.NumberColumn(format="R$ %.2f") for c in ["NF", "Corretivas", "Preventivas", "Relatórios", "Glosa total", "A pagar"]}
+    cols = ["Valor mensal", "Corretivas", "Preventivas", "Relatórios", "Glosa total", "A faturar"]
+    cfg = {c: st.column_config.NumberColumn(format="R$ %.2f") for c in cols}
     st.dataframe(df, hide_index=True, use_container_width=True, column_config=cfg)
 
 
@@ -409,25 +404,8 @@ with st.expander("Termos do contrato (glosas, SLA e e-mail)", expanded=not termo
         key=f"modo_{ck}",
     )
 
-# ---- Passo 2: NF
-st.subheader("2 · Nota fiscal")
-salvo = get_boletim(unidade, contrato, mes)
-n1, n2 = st.columns(2)
-nf_num = n1.text_input("Número da NF", value=salvo["nf_num"] if salvo else "", key=f"nfn_{k}")
-nf = n2.number_input(
-    "Valor da NF (R$)", min_value=0.0, value=float(salvo["nf"]) if salvo else mensal,
-    step=100.0, format="%.2f", key=f"nf_{k}",
-)
-dif = nf - mensal
-if nf == 0:
-    st.info("Informe o valor da NF.")
-elif abs(dif) < 0.005:
-    st.success(f"NF confere com o valor mensal do contrato ({brl(mensal)}).")
-else:
-    st.warning(f"NF diverge do valor mensal do contrato ({brl(mensal)}): diferença de {brl(dif)}. Confirme antes de seguir.")
-
-# ---- Passo 3: ocorrências
-st.subheader("3 · Ocorrências do mês")
+# ---- Passo 2: ocorrências
+st.subheader("2 · Ocorrências do mês")
 abas = st.tabs(["Corretivas", "Preventivas", "Relatórios"])
 dfs = {}
 for aba, tipo in zip(abas, TIPOS):
@@ -453,24 +431,25 @@ for aba, tipo in zip(abas, TIPOS):
 if st.button("💾 Salvar boletim", type="primary"):
     termos.update({"unidade": unidade, "contrato": contrato})
     save_termos(termos)
-    save_boletim(unidade, contrato, mes, nf_num.strip(), nf)
+    save_boletim(unidade, contrato, mes, mensal)
     for tipo in TIPOS:
         save_occ(unidade, contrato, mes, tipo, dfs[tipo])
     st.success("Boletim salvo.")
 
-# ---- Passo 4: resultado e e-mail
-st.subheader("4 · Resultado e envio")
-res = calcular(termos, nf, dfs)
-m1, m2 = st.columns(2)
-m1.metric("Total de glosas", brl(res["total"]))
-m2.metric("Valor a pagar", brl(res["pagar"]))
+# ---- Passo 3: resultado e e-mail
+st.subheader("3 · Resultado e envio")
+res = calcular(termos, mensal, dfs)
+m1, m2, m3 = st.columns(3)
+m1.metric("Valor mensal", brl(mensal))
+m2.metric("Glosas", brl(res["total"]))
+m3.metric("A faturar (NF)", brl(res["pagar"]), help="Valor que o fornecedor deve usar na emissão da NF.")
 for p in res["partes"]:
     st.write(
         f"**{p['nome']}** — {p['viol']} de {p['n']} com descumprimento · "
         + (f":red[− {brl(p['valor'])}] ({pct(p['pct'])})" if p["valor"] else ":green[Sem glosa]")
     )
 
-texto = st.text_area("Parecer ao fornecedor (edite se precisar)", parecer(ctr, mes, nf_num, mensal, res), height=360)
+texto = st.text_area("Parecer ao fornecedor (edite se precisar)", parecer(ctr, mes, mensal, res), height=360)
 assunto = f"Boletim de Medição - {unidade} - {sistema} ({contrato}) - {mes}"
 cfg_mail = smtp_cfg()
 if not termos["email"]:
@@ -486,8 +465,8 @@ else:
     st.warning("SMTP não configurado no servidor. Use o botão abaixo para abrir no seu app de e-mail.")
     st.link_button("✉ Abrir no app de e-mail", f"mailto:{termos['email']}?subject={quote(assunto)}&body={quote(texto)}")
 
-# ---- Passo 5: resumo
-st.subheader(f"5 · Resumo de {mes} · {unidade}")
+# ---- Passo 4: resumo
+st.subheader(f"4 · Resumo de {mes} · {unidade}")
 res_u = resumo_unidade(cad_u, mes)
 tabela_resumo(res_u)
 pend = int((res_u["Status"] == "Pendente").sum())
