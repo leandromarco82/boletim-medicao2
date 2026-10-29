@@ -1,41 +1,37 @@
-# Boletim de Medição – Glosas (Streamlit)
+# Boletim de Medição – Glosas (Streamlit) · versão 2
 
-Controle mensal de glosas na NF por sistema: Gerador, Sistema Elétrico, SDAI,
-Elevadores, Nobreaks e Combate Convencional de Incêndio.
+Fluxo: **Unidade → Sistema → Contrato → NF → Ocorrências → Glosa e e-mail → Resumo**.
+Os contratos vêm da planilha `contratos.xlsx` (colunas: Unidade, Sistema, Fornecedor, Contrato, Valor anual).
 
-## Rodar no seu computador
+## O que mudou na v2
+- Cada unidade escolhe seu sistema; fornecedor, contrato e valor anual vêm da planilha.
+- Conferência da NF: o app compara o valor da NF com o valor mensal do contrato (anual ÷ 12) e avisa se houver diferença.
+- Número da NF registrado e incluído no parecer.
+- Glosas, SLA e e-mail são guardados por unidade + contrato (o mesmo código de contrato pode existir em unidades diferentes).
+- Resumo por unidade, com status Lançado/Pendente, e resumo de todas as unidades (CSV).
+- Planilha atualizável pelo menu lateral (Cadastro de contratos), sem mexer no código.
+
+## Como atualizar no GitHub
+No repositório, use *Add file → Upload files* e envie: `app.py`, `requirements.txt`,
+`contratos.xlsx` e `README.md` (confirme a substituição). O Streamlit atualiza sozinho.
+Os dados de teste da versão 1 não são aproveitados (a v2 usa tabelas novas).
+
+## Rodar no computador
 ```
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Abre em http://localhost:8501. Os dados ficam no arquivo `boletim.db` (SQLite).
 
-## Variáveis / segredos (opcionais)
-Em servidor, defina como variáveis de ambiente. No Streamlit Community Cloud,
-cole em *Settings → Secrets* (formato TOML, ex.: `SMTP_HOST = "smtp.gmail.com"`).
+## Segredos (opcionais)
+Em *Settings → Secrets* (Streamlit Cloud) ou variáveis de ambiente:
+`APP_PASSWORD`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_CC`, `BOLETIM_DB`.
+Sem SMTP, o app mostra o botão "Abrir no app de e-mail".
 
-| Nome | Para quê |
-|---|---|
-| `APP_PASSWORD` | Senha de acesso ao app. Sem ela, qualquer um com o link entra. |
-| `SMTP_HOST`, `SMTP_PORT` | Servidor de e-mail (587 STARTTLS ou 465 SSL). |
-| `SMTP_USER`, `SMTP_PASSWORD` | Login do e-mail. No Gmail, use "senha de app". |
-| `SMTP_FROM`, `SMTP_CC` | Remetente e cópia (opcionais). |
-| `BOLETIM_DB` | Caminho do arquivo do banco (ex.: `/data/boletim.db`). |
-
-Sem SMTP configurado, o app mostra o botão "Abrir no app de e-mail" (mailto).
-
-## Publicar
-**Importante:** o SQLite precisa de disco que não seja apagado.
-- **Render** (Web Service + Persistent Disk): build `pip install -r requirements.txt`,
-  start `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`,
-  disco montado em `/data` e `BOLETIM_DB=/data/boletim.db`.
-- **Railway**: igual, com um Volume.
-- **Streamlit Community Cloud**: mais fácil, mas o disco é temporário (dados podem
-  sumir ao reiniciar). Serve para testar; para uso real, troque o SQLite por
-  PostgreSQL (Supabase/Neon, gratuitos).
+## Atenção
+O Streamlit Community Cloud apaga o disco ao reiniciar. Para uso oficial, publique no
+Render/Railway com disco persistente ou troque o SQLite por PostgreSQL (Supabase/Neon).
 
 ## Regras de cálculo
-- Corretiva: fora do SLA se (atendimento − abertura) > SLA em horas, ou se não houver atendimento.
-- Preventiva / relatório: fora do prazo se a data real > prazo, ou se estiver em branco.
-- Glosa "uma vez": aplica o % cheio se houver ao menos 1 descumprimento.
-  "Por ocorrência": % × nº de descumprimentos, limitado a 100%. A soma nunca passa do valor da NF.
+- Corretiva: fora do SLA se (atendimento − abertura) > SLA em horas, ou sem atendimento.
+- Preventiva/relatório: fora do prazo se a data real > prazo, ou em branco.
+- Glosa "uma vez": % cheio se houver ao menos 1 descumprimento. "Por ocorrência": % × nº de descumprimentos (máx. 100%). A soma nunca passa do valor da NF.

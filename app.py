@@ -2,23 +2,18 @@ import os
 import smtplib
 import sqlite3
 import ssl
+import unicodedata
 from datetime import date
 from email.message import EmailMessage
+from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 
 DB = os.environ.get("BOLETIM_DB", "boletim.db")
+PLANILHA_PADRAO = Path(__file__).parent / "contratos.xlsx"
 
-SISTEMAS = [
-    "Gerador",
-    "Sistema Elétrico",
-    "SDAI",
-    "Elevadores",
-    "Nobreaks",
-    "Combate Convencional de Incêndio",
-]
 TIPOS = {
     "c": "Corretivas fora do SLA",
     "p": "Preventivas fora do prazo ou não executadas",
@@ -26,6 +21,7 @@ TIPOS = {
 }
 PCT_KEY = {"c": "pc", "p": "pp", "r": "pr"}
 ROTULOS = {"c": ("Abertura", "Atendimento"), "p": ("Prazo", "Execução"), "r": ("Prazo", "Entrega")}
+COLS = ["unidade", "sistema", "fornecedor", "contrato", "valor_anual"]
 
 
 # ---------------------------------------------------------------- utilidades
@@ -47,6 +43,38 @@ def secret(nome, padrao=None):
         return padrao
 
 
+def _n(s):
+    t = unicodedata.normalize("NFD", str(s))
+    return "".join(c for c in t if unicodedata.category(c) != "Mn").strip().lower()
+
+
+def normalizar(df):
+    """Aceita variações de cabeçalho (acentos, maiúsculas, 'Fornacedor' etc.)."""
+    ren = {}
+    for c in df.columns:
+        n = _n(c)
+        if n == "unidade":
+            ren[c] = "unidade"
+        elif n == "sistema":
+            ren[c] = "sistema"
+        elif n.startswith("forn"):
+            ren[c] = "fornecedor"
+        elif n == "contrato":
+            ren[c] = "contrato"
+        elif n.startswith("valor"):
+            ren[c] = "valor_anual"
+    df = df.rename(columns=ren)
+    faltam = [c for c in COLS if c not in df.columns]
+    if faltam:
+        raise ValueError("Colunas não encontradas: " + ", ".join(faltam))
+    df = df[COLS].dropna(subset=["unidade", "sistema", "contrato"]).copy()
+    df["fornecedor"] = df["fornecedor"].fillna("")
+    for c in ["unidade", "sistema", "fornecedor", "contrato"]:
+        df[c] = df[c].astype(str).str.strip()
+    df["valor_anual"] = pd.to_numeric(df["valor_anual"], errors="coerce").fillna(0.0)
+    return df.drop_duplicates(["unidade", "contrato"], keep="last").reset_index(drop=True)
+
+
 # ------------------------------------------------------------------- banco
 def db():
     con = sqlite3.connect(DB)
@@ -58,42 +86,77 @@ def init():
     with db() as con:
         con.executescript(
             """
-            CREATE TABLE IF NOT EXISTS contratos(
-                sistema TEXT PRIMARY KEY, fornecedor TEXT DEFAULT '', email TEXT DEFAULT '',
+            CREATE TABLE IF NOT EXISTS b_cadastro(
+                unidade TEXT, sistema TEXT, fornecedor TEXT, contrato TEXT, valor_anual REAL,
+                PRIMARY KEY(unidade, contrato));
+            CREATE TABLE IF NOT EXISTS b_termos(
+                unidade TEXT, contrato TEXT, email TEXT DEFAULT '',
                 pc REAL DEFAULT 3, pp REAL DEFAULT 5, pr REAL DEFAULT 2,
-                sla REAL DEFAULT 4, modo TEXT DEFAULT 'u');
-            CREATE TABLE IF NOT EXISTS boletins(
-                sistema TEXT, mes TEXT, nf REAL DEFAULT 0, PRIMARY KEY(sistema, mes));
-            CREATE TABLE IF NOT EXISTS ocorrencias(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, sistema TEXT, mes TEXT,
+                sla REAL DEFAULT 4, modo TEXT DEFAULT 'u', PRIMARY KEY(unidade, contrato));
+            CREATE TABLE IF NOT EXISTS b_boletins(
+                unidade TEXT, contrato TEXT, mes TEXT, nf_num TEXT DEFAULT '', nf REAL DEFAULT 0,
+                PRIMARY KEY(unidade, contrato, mes));
+            CREATE TABLE IF NOT EXISTS b_ocorr(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, unidade TEXT, contrato TEXT, mes TEXT,
                 tipo TEXT, os TEXT, a TEXT, b TEXT, sla REAL);
             """
         )
+        vazio_ = con.execute("SELECT COUNT(*) FROM b_cadastro").fetchone()[0] == 0
+    if vazio_ and PLANILHA_PADRAO.exists():
+        importar_cadastro(normalizar(pd.read_excel(PLANILHA_PADRAO)))
 
 
-def get_contrato(sistema):
+def importar_cadastro(df):
     with db() as con:
-        con.execute("INSERT OR IGNORE INTO contratos(sistema) VALUES (?)", (sistema,))
-        return dict(con.execute("SELECT * FROM contratos WHERE sistema=?", (sistema,)).fetchone())
-
-
-def save_contrato(c):
-    with db() as con:
-        con.execute(
-            "UPDATE contratos SET fornecedor=?, email=?, pc=?, pp=?, pr=?, sla=?, modo=? WHERE sistema=?",
-            (c["fornecedor"], c["email"], c["pc"], c["pp"], c["pr"], c["sla"], c["modo"], c["sistema"]),
+        con.execute("DELETE FROM b_cadastro")
+        con.executemany(
+            "INSERT INTO b_cadastro VALUES (?,?,?,?,?)",
+            [tuple(r) for r in df[COLS].itertuples(index=False, name=None)],
         )
 
 
-def get_nf(sistema, mes):
+def cadastro():
     with db() as con:
-        r = con.execute("SELECT nf FROM boletins WHERE sistema=? AND mes=?", (sistema, mes)).fetchone()
-    return float(r["nf"]) if r else 0.0
+        rows = con.execute("SELECT * FROM b_cadastro ORDER BY unidade, sistema, contrato").fetchall()
+    return pd.DataFrame([dict(r) for r in rows], columns=COLS)
 
 
-def save_nf(sistema, mes, nf):
+def get_termos(unidade, contrato, fornecedor):
     with db() as con:
-        con.execute("INSERT OR REPLACE INTO boletins(sistema, mes, nf) VALUES (?,?,?)", (sistema, mes, nf))
+        r = con.execute("SELECT * FROM b_termos WHERE unidade=? AND contrato=?", (unidade, contrato)).fetchone()
+        if r is None:
+            em = con.execute(
+                "SELECT t.email FROM b_termos t JOIN b_cadastro c ON c.unidade=t.unidade AND c.contrato=t.contrato "
+                "WHERE c.fornecedor=? AND t.email<>'' LIMIT 1",
+                (fornecedor,),
+            ).fetchone()
+            con.execute("INSERT INTO b_termos(unidade, contrato, email) VALUES (?,?,?)", (unidade, contrato, em[0] if em else ""))
+            r = con.execute("SELECT * FROM b_termos WHERE unidade=? AND contrato=?", (unidade, contrato)).fetchone()
+    return dict(r)
+
+
+def save_termos(t):
+    with db() as con:
+        con.execute(
+            "UPDATE b_termos SET email=?, pc=?, pp=?, pr=?, sla=?, modo=? WHERE unidade=? AND contrato=?",
+            (t["email"], t["pc"], t["pp"], t["pr"], t["sla"], t["modo"], t["unidade"], t["contrato"]),
+        )
+
+
+def get_boletim(unidade, contrato, mes):
+    with db() as con:
+        r = con.execute(
+            "SELECT nf_num, nf FROM b_boletins WHERE unidade=? AND contrato=? AND mes=?", (unidade, contrato, mes)
+        ).fetchone()
+    return dict(r) if r else None
+
+
+def save_boletim(unidade, contrato, mes, nf_num, nf):
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO b_boletins(unidade, contrato, mes, nf_num, nf) VALUES (?,?,?,?,?)",
+            (unidade, contrato, mes, nf_num, nf),
+        )
 
 
 def vazio(tipo):
@@ -107,11 +170,11 @@ def vazio(tipo):
     return pd.DataFrame(d)
 
 
-def load_occ(sistema, mes, tipo):
+def load_occ(unidade, contrato, mes, tipo):
     with db() as con:
         rows = con.execute(
-            "SELECT os, a, b, sla FROM ocorrencias WHERE sistema=? AND mes=? AND tipo=? ORDER BY id",
-            (sistema, mes, tipo),
+            "SELECT os, a, b, sla FROM b_ocorr WHERE unidade=? AND contrato=? AND mes=? AND tipo=? ORDER BY id",
+            (unidade, contrato, mes, tipo),
         ).fetchall()
     if not rows:
         return vazio(tipo)
@@ -121,9 +184,11 @@ def load_occ(sistema, mes, tipo):
     return df if tipo == "c" else df.drop(columns=["sla"])
 
 
-def save_occ(sistema, mes, tipo, df):
+def save_occ(unidade, contrato, mes, tipo, df):
     with db() as con:
-        con.execute("DELETE FROM ocorrencias WHERE sistema=? AND mes=? AND tipo=?", (sistema, mes, tipo))
+        con.execute(
+            "DELETE FROM b_ocorr WHERE unidade=? AND contrato=? AND mes=? AND tipo=?", (unidade, contrato, mes, tipo)
+        )
         for _, r in df.iterrows():
             a, b = pd.to_datetime(r.get("a"), errors="coerce"), pd.to_datetime(r.get("b"), errors="coerce")
             os_ = r.get("os")
@@ -131,9 +196,9 @@ def save_occ(sistema, mes, tipo, df):
                 continue
             sla = r.get("sla")
             con.execute(
-                "INSERT INTO ocorrencias(sistema, mes, tipo, os, a, b, sla) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO b_ocorr(unidade, contrato, mes, tipo, os, a, b, sla) VALUES (?,?,?,?,?,?,?,?)",
                 (
-                    sistema, mes, tipo,
+                    unidade, contrato, mes, tipo,
                     None if os_ is None or pd.isna(os_) else str(os_),
                     None if pd.isna(a) else a.isoformat(),
                     None if pd.isna(b) else b.isoformat(),
@@ -150,7 +215,7 @@ def atrasado(tipo, row, sla_padrao):
     if pd.isna(a):
         return None
     if pd.isna(b):
-        return True  # não atendida / não executada / não entregue
+        return True
     if tipo == "c":
         horas = (b - a).total_seconds() / 3600
         sla = row.get("sla")
@@ -159,18 +224,18 @@ def atrasado(tipo, row, sla_padrao):
     return b.normalize() > a.normalize()
 
 
-def calcular(contrato, nf, dfs):
+def calcular(termos, nf, dfs):
     partes, total = [], 0.0
     for tipo, nome in TIPOS.items():
         viol, n = 0, 0
         for _, row in dfs[tipo].iterrows():
-            r = atrasado(tipo, row, contrato["sla"])
+            r = atrasado(tipo, row, termos["sla"])
             if r is None:
                 continue
             n += 1
             viol += int(r)
-        p = float(contrato[PCT_KEY[tipo]])
-        aplicado = 0.0 if viol == 0 else (p if contrato["modo"] == "u" else min(100.0, p * viol))
+        p = float(termos[PCT_KEY[tipo]])
+        aplicado = 0.0 if viol == 0 else (p if termos["modo"] == "u" else min(100.0, p * viol))
         valor = nf * aplicado / 100
         total += valor
         partes.append({"tipo": tipo, "nome": nome, "viol": viol, "n": n, "pct": aplicado, "valor": valor})
@@ -178,13 +243,18 @@ def calcular(contrato, nf, dfs):
     return {"partes": partes, "total": total, "pagar": nf - total, "nf": nf}
 
 
-def parecer(sistema, mes, contrato, res):
+def parecer(c, mes, nf_num, mensal, res):
     linhas = [
         f"• {p['nome']}: {p['viol']} de {p['n']} ocorrência(s) com descumprimento → "
         + (f"glosa de {pct(p['pct'])} ({brl(p['valor'])})" if p["valor"] else "sem glosa")
         for p in res["partes"]
     ]
-    forn = f" ({contrato['fornecedor']})" if contrato["fornecedor"] else ""
+    dif = res["nf"] - mensal
+    conf = (
+        "NF compatível com o valor mensal do contrato."
+        if abs(dif) < 0.005
+        else f"ATENÇÃO: NF diverge do valor mensal do contrato ({brl(mensal)}) em {brl(dif)}."
+    )
     fecho = (
         "Solicitamos a emissão de NF/ajuste considerando as glosas acima. "
         "Em caso de contestação, favor encaminhar as evidências."
@@ -192,9 +262,13 @@ def parecer(sistema, mes, contrato, res):
         else "Não há glosas neste período."
     )
     return (
-        f"Prezados{forn},\n\nSegue o resultado da medição de {sistema} referente a {mes}.\n\n"
-        f"Valor da NF: {brl(res['nf'])}\n\n" + "\n".join(linhas) + "\n\n"
-        f"Total de glosas: {brl(res['total'])}\nValor a pagar: {brl(res['pagar'])}\n\n{fecho}\n\n"
+        f"Prezados ({c['fornecedor']}),\n\n"
+        f"Segue o resultado da medição referente a {mes}.\n"
+        f"Unidade: {c['unidade']}\nSistema: {c['sistema']}\nContrato: {c['contrato']}\n"
+        f"NF nº: {nf_num or 'não informada'}\n\n"
+        f"Valor da NF: {brl(res['nf'])}\n{conf}\n\n"
+        + "\n".join(linhas)
+        + f"\n\nTotal de glosas: {brl(res['total'])}\nValor a pagar: {brl(res['pagar'])}\n\n{fecho}\n\n"
         "Atenciosamente,\nGestão de Manutenção"
     )
 
@@ -232,6 +306,31 @@ def enviar(cfg, destino, assunto, corpo):
             s.send_message(msg)
 
 
+def resumo_unidade(cad_u, mes):
+    linhas = []
+    for _, c in cad_u.iterrows():
+        t = get_termos(c["unidade"], c["contrato"], c["fornecedor"])
+        b = get_boletim(c["unidade"], c["contrato"], mes)
+        d = {tp: load_occ(c["unidade"], c["contrato"], mes, tp) for tp in TIPOS}
+        nf = b["nf"] if b else 0.0
+        r = calcular(t, nf, d)
+        linhas.append(
+            {
+                "Unidade": c["unidade"], "Sistema": c["sistema"], "Contrato": c["contrato"],
+                "Fornecedor": c["fornecedor"], "Status": "Lançado" if b else "Pendente",
+                "NF nº": b["nf_num"] if b else "", "NF": nf,
+                "Corretivas": r["partes"][0]["valor"], "Preventivas": r["partes"][1]["valor"],
+                "Relatórios": r["partes"][2]["valor"], "Glosa total": r["total"], "A pagar": r["pagar"],
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
+def tabela_resumo(df):
+    cfg = {c: st.column_config.NumberColumn(format="R$ %.2f") for c in ["NF", "Corretivas", "Preventivas", "Relatórios", "Glosa total", "A pagar"]}
+    st.dataframe(df, hide_index=True, use_container_width=True, column_config=cfg)
+
+
 # ---------------------------------------------------------------- interface
 st.set_page_config(page_title="Boletim de Medição", page_icon="🧾", layout="centered")
 init()
@@ -250,73 +349,118 @@ if senha and not st.session_state.get("ok"):
 
 st.title("🧾 Boletim de Medição")
 
+cad = cadastro()
+
 with st.sidebar:
-    sistema = st.selectbox("Sistema", SISTEMAS)
     mes = st.text_input("Mês de referência (AAAA-MM)", value=date.today().strftime("%Y-%m"))
-    st.caption("Os dados ficam salvos no servidor e são compartilhados por todos que acessarem.")
+    with st.expander("Cadastro de contratos"):
+        st.caption(f"{len(cad)} contratos em {cad['unidade'].nunique() if len(cad) else 0} unidade(s).")
+        up = st.file_uploader("Atualizar com nova planilha (.xlsx)", type=["xlsx"])
+        if up is not None and st.button("Substituir cadastro"):
+            try:
+                importar_cadastro(normalizar(pd.read_excel(up)))
+                st.success("Cadastro atualizado.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível ler a planilha: {e}")
+        st.caption("Colunas: Unidade, Sistema, Fornecedor, Contrato, Valor anual.")
 
-contrato = get_contrato(sistema)
-k = f"{sistema}_{mes}"
+if cad.empty:
+    st.warning("Nenhum contrato cadastrado. Envie a planilha no menu lateral (Cadastro de contratos).")
+    st.stop()
 
-with st.expander(f"Contrato · {sistema}", expanded=not contrato["fornecedor"]):
-    c1, c2 = st.columns(2)
-    contrato["fornecedor"] = c1.text_input("Fornecedor", contrato["fornecedor"], key=f"f_{sistema}")
-    contrato["email"] = c2.text_input("E-mail do fornecedor", contrato["email"], key=f"e_{sistema}")
+# ---- Passo 1: unidade, sistema e contrato
+st.subheader("1 · Unidade, sistema e contrato")
+c1, c2 = st.columns(2)
+unidade = c1.selectbox("Unidade", sorted(cad["unidade"].unique()))
+cad_u = cad[cad["unidade"] == unidade]
+sistema = c2.selectbox("Sistema", sorted(cad_u["sistema"].unique()))
+cad_s = cad_u[cad_u["sistema"] == sistema]
+if len(cad_s) > 1:
+    contrato = st.selectbox("Contrato", list(cad_s["contrato"]))
+    linha = cad_s[cad_s["contrato"] == contrato].iloc[0]
+else:
+    linha = cad_s.iloc[0]
+contrato = linha["contrato"]
+ctr = {"unidade": unidade, "sistema": sistema, "fornecedor": linha["fornecedor"], "contrato": contrato}
+anual = float(linha["valor_anual"])
+mensal = round(anual / 12, 2)
+ck = f"{unidade}|{contrato}"
+k = f"{ck}|{mes}"
+
+i1, i2, i3 = st.columns(3)
+i1.metric("Fornecedor", linha["fornecedor"] or "—")
+i2.metric("Contrato", contrato)
+i3.metric("Valor mensal", brl(mensal), help=f"Valor anual {brl(anual)} ÷ 12")
+
+termos = get_termos(unidade, contrato, linha["fornecedor"])
+with st.expander("Termos do contrato (glosas, SLA e e-mail)", expanded=not termos["email"]):
+    termos["email"] = st.text_input("E-mail do fornecedor", termos["email"], key=f"e_{ck}")
     g1, g2, g3, g4 = st.columns(4)
-    contrato["pc"] = g1.number_input("Corretivas %", 0.0, 100.0, float(contrato["pc"]), 0.5, key=f"pc_{sistema}")
-    contrato["pp"] = g2.number_input("Preventivas %", 0.0, 100.0, float(contrato["pp"]), 0.5, key=f"pp_{sistema}")
-    contrato["pr"] = g3.number_input("Relatórios %", 0.0, 100.0, float(contrato["pr"]), 0.5, key=f"pr_{sistema}")
-    contrato["sla"] = g4.number_input("SLA padrão (h)", 0.0, 720.0, float(contrato["sla"]), 1.0, key=f"sla_{sistema}")
-    contrato["modo"] = st.radio(
+    termos["pc"] = g1.number_input("Corretivas %", 0.0, 100.0, float(termos["pc"]), 0.5, key=f"pc_{ck}")
+    termos["pp"] = g2.number_input("Preventivas %", 0.0, 100.0, float(termos["pp"]), 0.5, key=f"pp_{ck}")
+    termos["pr"] = g3.number_input("Relatórios %", 0.0, 100.0, float(termos["pr"]), 0.5, key=f"pr_{ck}")
+    termos["sla"] = g4.number_input("SLA padrão (h)", 0.0, 720.0, float(termos["sla"]), 1.0, key=f"sla_{ck}")
+    termos["modo"] = st.radio(
         "Como aplicar a glosa",
         ["u", "o"],
-        index=0 if contrato["modo"] == "u" else 1,
+        index=0 if termos["modo"] == "u" else 1,
         format_func=lambda x: "Uma vez, se houver ao menos 1 descumprimento" if x == "u" else "Por ocorrência (limitado a 100%)",
-        key=f"modo_{sistema}",
+        key=f"modo_{ck}",
     )
 
-nf = st.number_input("Valor da NF (R$)", min_value=0.0, value=get_nf(sistema, mes), step=100.0, format="%.2f", key=f"nf_{k}")
+# ---- Passo 2: NF
+st.subheader("2 · Nota fiscal")
+salvo = get_boletim(unidade, contrato, mes)
+n1, n2 = st.columns(2)
+nf_num = n1.text_input("Número da NF", value=salvo["nf_num"] if salvo else "", key=f"nfn_{k}")
+nf = n2.number_input(
+    "Valor da NF (R$)", min_value=0.0, value=float(salvo["nf"]) if salvo else mensal,
+    step=100.0, format="%.2f", key=f"nf_{k}",
+)
+dif = nf - mensal
+if nf == 0:
+    st.info("Informe o valor da NF.")
+elif abs(dif) < 0.005:
+    st.success(f"NF confere com o valor mensal do contrato ({brl(mensal)}).")
+else:
+    st.warning(f"NF diverge do valor mensal do contrato ({brl(mensal)}): diferença de {brl(dif)}. Confirme antes de seguir.")
 
-abas = st.tabs(["1 · Corretivas", "2 · Preventivas", "3 · Relatórios"])
+# ---- Passo 3: ocorrências
+st.subheader("3 · Ocorrências do mês")
+abas = st.tabs(["Corretivas", "Preventivas", "Relatórios"])
 dfs = {}
 for aba, tipo in zip(abas, TIPOS):
     with aba:
         la, lb = ROTULOS[tipo]
-        if tipo == "c":
-            st.caption("SLA h em branco = usa o SLA padrão. Sem data de atendimento = fora do SLA.")
-        elif tipo == "p":
-            st.caption("Sem data de execução = não executada no mês.")
-        else:
-            st.caption("Sem data de entrega = não entregue.")
+        st.caption(
+            {
+                "c": "SLA h em branco = usa o SLA padrão. Sem data de atendimento = fora do SLA.",
+                "p": "Sem data de execução = não executada no mês.",
+                "r": "Sem data de entrega = não entregue.",
+            }[tipo]
+        )
         col = st.column_config.DatetimeColumn if tipo == "c" else st.column_config.DateColumn
         fmt = "DD/MM/YYYY HH:mm" if tipo == "c" else "DD/MM/YYYY"
-        cfg = {
-            "os": st.column_config.TextColumn("OS"),
-            "a": col(la, format=fmt),
-            "b": col(lb, format=fmt),
-        }
+        cfg = {"os": st.column_config.TextColumn("OS"), "a": col(la, format=fmt), "b": col(lb, format=fmt)}
         if tipo == "c":
             cfg["sla"] = st.column_config.NumberColumn("SLA h", min_value=0.0)
         dfs[tipo] = st.data_editor(
-            load_occ(sistema, mes, tipo),
-            column_config=cfg,
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            key=f"ed_{tipo}_{k}",
+            load_occ(unidade, contrato, mes, tipo), column_config=cfg, num_rows="dynamic",
+            use_container_width=True, hide_index=True, key=f"ed_{tipo}_{k}",
         )
 
 if st.button("💾 Salvar boletim", type="primary"):
-    contrato["sistema"] = sistema
-    save_contrato(contrato)
-    save_nf(sistema, mes, nf)
+    termos.update({"unidade": unidade, "contrato": contrato})
+    save_termos(termos)
+    save_boletim(unidade, contrato, mes, nf_num.strip(), nf)
     for tipo in TIPOS:
-        save_occ(sistema, mes, tipo, dfs[tipo])
+        save_occ(unidade, contrato, mes, tipo, dfs[tipo])
     st.success("Boletim salvo.")
 
-# ---------------------------------------------------------------- resultado
-res = calcular(contrato, nf, dfs)
-st.subheader("Resultado")
+# ---- Passo 4: resultado e e-mail
+st.subheader("4 · Resultado e envio")
+res = calcular(termos, nf, dfs)
 m1, m2 = st.columns(2)
 m1.metric("Total de glosas", brl(res["total"]))
 m2.metric("Valor a pagar", brl(res["pagar"]))
@@ -326,48 +470,33 @@ for p in res["partes"]:
         + (f":red[− {brl(p['valor'])}] ({pct(p['pct'])})" if p["valor"] else ":green[Sem glosa]")
     )
 
-st.subheader("Parecer ao fornecedor")
-texto = st.text_area("Edite se precisar antes de enviar", parecer(sistema, mes, contrato, res), height=320)
-assunto = f"Boletim de Medição - {sistema} - {mes}"
+texto = st.text_area("Parecer ao fornecedor (edite se precisar)", parecer(ctr, mes, nf_num, mensal, res), height=360)
+assunto = f"Boletim de Medição - {unidade} - {sistema} ({contrato}) - {mes}"
 cfg_mail = smtp_cfg()
-if not contrato["email"]:
-    st.info("Informe o e-mail do fornecedor no bloco Contrato.")
+if not termos["email"]:
+    st.info("Informe o e-mail do fornecedor em 'Termos do contrato'.")
 elif cfg_mail:
     if st.button("✉ Enviar e-mail ao fornecedor"):
         try:
-            enviar(cfg_mail, contrato["email"], assunto, texto)
-            st.success(f"E-mail enviado para {contrato['email']}.")
+            enviar(cfg_mail, termos["email"], assunto, texto)
+            st.success(f"E-mail enviado para {termos['email']}.")
         except Exception as e:
             st.error(f"Falha no envio: {e}")
 else:
     st.warning("SMTP não configurado no servidor. Use o botão abaixo para abrir no seu app de e-mail.")
-    st.link_button("✉ Abrir no app de e-mail", f"mailto:{contrato['email']}?subject={quote(assunto)}&body={quote(texto)}")
+    st.link_button("✉ Abrir no app de e-mail", f"mailto:{termos['email']}?subject={quote(assunto)}&body={quote(texto)}")
 
-# ------------------------------------------------------------------- resumo
-st.subheader(f"Resumo de {mes} · todos os sistemas")
-linhas = []
-for s in SISTEMAS:
-    c = get_contrato(s)
-    d = {t: load_occ(s, mes, t) for t in TIPOS}
-    r = calcular(c, get_nf(s, mes), d)
-    linhas.append(
-        {
-            "Sistema": s,
-            "Fornecedor": c["fornecedor"],
-            "NF": r["nf"],
-            "Corretivas": r["partes"][0]["valor"],
-            "Preventivas": r["partes"][1]["valor"],
-            "Relatórios": r["partes"][2]["valor"],
-            "Glosa total": r["total"],
-            "A pagar": r["pagar"],
-        }
-    )
-resumo = pd.DataFrame(linhas)
-st.dataframe(
-    resumo,
-    hide_index=True,
-    use_container_width=True,
-    column_config={c: st.column_config.NumberColumn(format="R$ %.2f") for c in resumo.columns[2:]},
-)
-st.metric("Total geral de glosas (dados salvos)", brl(float(resumo["Glosa total"].sum())))
-st.download_button("Baixar resumo (CSV)", resumo.to_csv(index=False, sep=";", decimal=","), f"resumo_{mes}.csv", "text/csv")
+# ---- Passo 5: resumo
+st.subheader(f"5 · Resumo de {mes} · {unidade}")
+res_u = resumo_unidade(cad_u, mes)
+tabela_resumo(res_u)
+pend = int((res_u["Status"] == "Pendente").sum())
+st.caption(f"{pend} contrato(s) ainda pendente(s) nesta unidade." if pend else "Todos os contratos da unidade foram lançados.")
+st.metric("Glosa total da unidade (dados salvos)", brl(float(res_u["Glosa total"].sum())))
+st.download_button("Baixar resumo da unidade (CSV)", res_u.to_csv(index=False, sep=";", decimal=","), f"resumo_{unidade}_{mes}.csv", "text/csv")
+
+with st.expander("Todas as unidades"):
+    res_t = resumo_unidade(cad, mes)
+    tabela_resumo(res_t)
+    st.metric("Glosa total geral (dados salvos)", brl(float(res_t["Glosa total"].sum())))
+    st.download_button("Baixar resumo geral (CSV)", res_t.to_csv(index=False, sep=";", decimal=","), f"resumo_geral_{mes}.csv", "text/csv", key="dl_geral")
